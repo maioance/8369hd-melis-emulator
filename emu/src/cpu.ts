@@ -13,6 +13,7 @@ export class CpuHalt extends Error {}
 export interface Host {
   ecall(cpu: Cpu): void;
   trap(cpu: Cpu, pc: number): void; // must set cpu.pc
+  watch?(cpu: Cpu, pc: number): void; // EMU_WATCH: called before executing a watched address
 }
 
 const PAGE_BITS = 12;
@@ -47,6 +48,11 @@ export class Cpu {
   frm = 0; fflags = 0;
   csrs = new Map<number, number>();
   lastPc = 0;
+  /** EMU_WATCH=addr,addr..: guest addresses whose execution the host logs (with ra and a0 as a string) */
+  watch = process.env.EMU_WATCH || process.env.EMU_FORCE
+    ? new Set([...(process.env.EMU_WATCH ?? '').split(','), ...(process.env.EMU_FORCE ?? '').split(',').map(s => s.split(':')[0])]
+      .filter(Boolean).map(s => parseInt(s, 16) >>> 0))
+    : undefined;
   stopReq = false; // set by the host to leave run() after the current ecall/trap
   private pages = new Map<number, (Insn | undefined)[]>();
   readonly mem: Memory;
@@ -105,20 +111,33 @@ export class Cpu {
   /** Run until `maxSteps` instructions have executed or a host handler throws CpuHalt. */
   run(maxSteps: number): void {
     const R = this.R, mem = this.mem, F64 = this.F64, F32 = this.F32, FI = this.FI;
-    const end = this.steps + maxSteps;
+    // Hot-loop state lives in locals; this.steps / this.lastPc are synced before host calls and on exit.
+    let steps = this.steps, lastPc = this.lastPc;
+    const end = steps + maxSteps;
     let pc = this.pc;
+    let curPg = -1, page: (Insn | undefined)[] = [];
     try {
-      while (this.steps < end) {
+      while (steps < end) {
         if (pc >= TRAP_BASE) {
-          this.pc = pc;
+          this.pc = pc; this.steps = steps; this.lastPc = lastPc;
           this.host.trap(this, pc);
-          pc = this.pc;
+          pc = this.pc; steps = this.steps; curPg = -1;
           if (this.stopReq) { this.stopReq = false; break; }
           continue;
         }
-        const i = this.fetch(pc);
-        this.lastPc = pc;
-        this.steps++;
+        if ((pc >>> PAGE_BITS) !== curPg) {
+          curPg = pc >>> PAGE_BITS;
+          let p = this.pages.get(curPg);
+          if (!p) { p = new Array(1 << (PAGE_BITS - 1)); this.pages.set(curPg, p); }
+          page = p;
+        }
+        const i = page[(pc & ((1 << PAGE_BITS) - 1)) >>> 1] ?? this.fetch(pc);
+        if (this.watch && this.watch.has(pc)) {
+          this.pc = pc; this.steps = steps; this.host.watch?.(this, pc);
+          if (this.pc !== pc) { pc = this.pc; curPg = -1; continue; }   // forced return
+        }
+        lastPc = pc;
+        steps++;
         let npc = (pc + i.len) >>> 0;
         const rd = i.rd, a = 2 * i.rs1, b = 2 * i.rs2, d = 2 * rd;
         let lo = 0, hi = 0, wr = true; // result for rd
@@ -127,7 +146,12 @@ export class Cpu {
           case O.LUI: lo = i.imm; hi = lo >> 31; break;
           case O.AUIPC: { lo = (pc + i.imm) | 0; hi = ((pc >>> 0) + (i.imm >>> 0) > 0xffffffff ? 1 : 0) + (i.imm >> 31); break; }
           case O.JAL: lo = npc | 0; hi = 0; npc = (pc + i.imm) >>> 0; break;
-          case O.JALR: { const t = ((R[a] + i.imm) & ~1) >>> 0; lo = npc | 0; hi = 0; npc = t; break; }
+          case O.JALR: {
+            const t = ((R[a] + i.imm) & ~1) >>> 0; lo = npc | 0; hi = 0; npc = t;
+            // a jump to itself never ends: on the device this hangs the thread (e.g. a syscall stub that lost ra)
+            if (t === pc) throw new CpuHalt(`endless loop: jalr to itself at 0x${pc.toString(16)}`);
+            break;
+          }
           case O.BEQ: wr = false; if (R[a] === R[b] && R[a + 1] === R[b + 1]) npc = (pc + i.imm) >>> 0; break;
           case O.BNE: wr = false; if (R[a] !== R[b] || R[a + 1] !== R[b + 1]) npc = (pc + i.imm) >>> 0; break;
           case O.BLT: wr = false; if (R[a + 1] < R[b + 1] || (R[a + 1] === R[b + 1] && (R[a] >>> 0) < (R[b] >>> 0))) npc = (pc + i.imm) >>> 0; break;
@@ -208,11 +232,13 @@ export class Cpu {
 
           case O.FENCE: case O.NOP: wr = false; break;
           case O.ECALL:
-            this.pc = npc; this.host.ecall(this); npc = this.pc; wr = false;
+            this.pc = npc; this.steps = steps; this.lastPc = lastPc;
+            this.host.ecall(this); npc = this.pc; steps = this.steps; curPg = -1; wr = false;
             if (this.stopReq) { this.stopReq = false; pc = npc; return; }
             break;
           case O.EBREAK: throw new CpuHalt(`ebreak at 0x${pc.toString(16)}`);
           case O.CSRRW: case O.CSRRS: case O.CSRRC: case O.CSRRWI: case O.CSRRSI: case O.CSRRCI: {
+            this.steps = steps;
             const old = this.csrRead(i.imm);
             const v = i.op >= O.CSRRWI ? i.imm2 : R[a];
             if (i.op === O.CSRRW || i.op === O.CSRRWI) this.csrWrite(i.imm, v);
@@ -433,7 +459,7 @@ export class Cpu {
         pc = npc;
       }
     } finally {
-      this.pc = pc;
+      this.pc = pc; this.steps = steps; this.lastPc = lastPc;
     }
   }
 

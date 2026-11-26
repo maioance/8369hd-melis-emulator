@@ -12,7 +12,10 @@ export interface Device {
   write?(buf: number, n: number): number;
 }
 
-export const SCREEN_W = 800, SCREEN_H = 480;
+export const SCREEN_W = 1024, SCREEN_H = 600;
+/** Guest RAM as the display engine sees it: it reads physical addresses (esMEMS_VA2PA), never kernel virtual ones.
+ *  The emulator maps physical 0x40000000 (D1s DRAM) onto virtual 0xe0000000. */
+export const PHYS_BASE = 0x40000000, VIRT_BASE = 0xe0000000, PHYS_SIZE = 0x10000000;
 
 // sunxi_display2.h command numbers
 const DISP = {
@@ -112,6 +115,9 @@ export class DispDevice implements Device {
     const desc = `ch${l.channel}.${l.layerId} ${l.enable ? 'on ' : 'off'} z=${l.zorder} fmt=0x${l.format.toString(16)} fb=0x${l.addr.toString(16)} ${l.fbW}x${l.fbH} crop=${l.crop.x},${l.crop.y},${l.crop.w}x${l.crop.h} win=${l.win.x},${l.win.y},${l.win.w}x${l.win.h} alpha=${l.alphaMode}/${l.alphaValue}`;
     if (!prev || prev.raw.some((v, i) => v !== l.raw[i])) {
       this.log(`  disp: layer ${desc}`);
+      if (l.enable && l.mode !== 1 && !(l.addr >= PHYS_BASE && l.addr < PHYS_BASE + PHYS_SIZE))
+        this.log(`  disp: WARNING layer ch${l.channel}.${l.layerId} fb=0x${l.addr.toString(16)} is not a physical address ` +
+                 '(use esMEMS_VA2PA): the real display engine would read outside RAM - not drawn');
       if (process.env.EMU_DUMP_LAYER) for (let k = 0; k < LC.SIZE; k += 16) this.log(`    +${k.toString(16).padStart(3, '0')}: ` + [...l.raw.subarray(k, k + 16)].map(x => x.toString(16).padStart(2, '0')).join(' '));
     }
     this.layers.set(key, l);
@@ -122,8 +128,23 @@ export class DispDevice implements Device {
     const out = new Uint8Array(SCREEN_W * SCREEN_H * 4);
     for (let i = 3; i < out.length; i += 4) out[i] = 255;
     if (this.blank || !this.backlight) return out;
-    const layers = [...this.layers.values()].filter(l => l.enable).sort((p, q) => p.zorder - q.zorder || p.channel - q.channel);
-    for (const l of layers) this.drawLayer(out, l);
+    // Like the D1s display engine (de_hal.c): the layers of one channel are overlaid WITHOUT blending (in its window
+    // the upper layer replaces what is below, transparent pixels included); only whole channels are alpha-blended,
+    // in zorder (equal zorders keep the channel order: video ch0 below UI ch1).
+    const layers = [...this.layers.values()].filter(l => l.enable);
+    const chans = [...new Set(layers.map(l => l.channel))].sort((p, q) =>
+      Math.max(...layers.filter(l => l.channel === p).map(l => l.zorder)) - Math.max(...layers.filter(l => l.channel === q).map(l => l.zorder)) || p - q);
+    const tmp = new Uint8Array(SCREEN_W * SCREEN_H * 4);
+    for (const c of chans) {
+      tmp.fill(0);
+      for (const l of layers.filter(l => l.channel === c).sort((p, q) => p.zorder - q.zorder || p.layerId - q.layerId))
+        this.drawLayer(tmp, l);
+      for (let i = 0; i < out.length; i += 4) {
+        const a = tmp[i + 3];
+        if (a === 255) { out[i] = tmp[i]; out[i + 1] = tmp[i + 1]; out[i + 2] = tmp[i + 2]; }
+        else if (a) { const k = a / 255; out[i] = tmp[i] * k + out[i] * (1 - k); out[i + 1] = tmp[i + 1] * k + out[i + 1] * (1 - k); out[i + 2] = tmp[i + 2] * k + out[i + 2] * (1 - k); }
+      }
+    }
     // show the backlight level (DISP_LCD_SET_BRIGHTNESS) as dimming
     if (this.brightness < 255) {
       const f = this.brightness / 255;
@@ -138,7 +159,8 @@ export class DispDevice implements Device {
     const bpp = l.format <= 0x07 ? 4 : l.format <= 0x09 ? 3 : 2;
     const cw = l.crop.w || l.fbW, ch = l.crop.h || l.fbH;
     const stride = l.fbW * bpp;
-    const buf = this.mem.buf, base = l.addr - 0xe0000000;
+    if (l.mode !== 1 && !(l.addr >= PHYS_BASE && l.addr < PHYS_BASE + PHYS_SIZE)) return;   // see the WARNING
+    const buf = this.mem.buf, base = l.addr - PHYS_BASE;
     for (let y = 0; y < wh; y++) {
       const sy = wy + y; if (sy < 0 || sy >= SCREEN_H) continue;
       const fy = l.crop.y + Math.floor(y * ch / wh);
@@ -166,14 +188,9 @@ export class DispDevice implements Device {
         }
         if (l.alphaMode === 1) a = l.alphaValue;
         else if (l.alphaMode === 2) a = a * l.alphaValue / 255;
-        const d = (sy * SCREEN_W + sx) * 4;
-        if (a >= 255) { out[d] = r; out[d + 1] = g; out[d + 2] = b; }
-        else if (a > 0) {
-          const k = a / 255;
-          out[d] = l.premul ? r + out[d] * (1 - k) : r * k + out[d] * (1 - k);
-          out[d + 1] = l.premul ? g + out[d + 1] * (1 - k) : g * k + out[d + 1] * (1 - k);
-          out[d + 2] = l.premul ? b + out[d + 2] * (1 - k) : b * k + out[d + 2] * (1 - k);
-        }
+        // into the channel buffer: replaced, not blended (see render)
+        const d = (sy * SCREEN_W + sx) * 4, k = l.premul && a ? 255 / a : 1;
+        out[d] = Math.min(255, r * k); out[d + 1] = Math.min(255, g * k); out[d + 2] = Math.min(255, b * k); out[d + 3] = a;
       }
     }
   }
@@ -191,6 +208,35 @@ export class StubDevice implements Device {
   }
   read(): number | 'block' { return 'block'; }  // e.g. UARTs: nothing ever arrives
   write(_b: number, n: number): number { return n; }
+}
+
+/** UART with an injectable RX queue (used to simulate the CAN box / MCU from the browser). */
+export class QueueUart implements Device {
+  name: string;
+  rx: number[] = [];
+  txLog: string[] = [];
+  /** Called with every write from the guest (for simulated peripherals behind this port). */
+  onTx?: (bytes: number[]) => void;
+  private mem: { write(addr: number, data: Uint8Array): void; read(addr: number, n: number): Uint8Array };
+  private log: (s: string) => void;
+  constructor(name: string, mem: QueueUart['mem'], log: (s: string) => void) { this.name = name; this.mem = mem; this.log = log; }
+  ioctl(): number { return 0; }
+  push(bytes: number[]): void { this.rx.push(...bytes.map(b => b & 0xff)); }
+  read(buf: number, n: number): number | 'block' {
+    if (!this.rx.length) return 'block';
+    const chunk = this.rx.splice(0, Math.min(n, this.rx.length));
+    this.mem.write(buf, Uint8Array.from(chunk));
+    this.log(`  ${this.name} RX ${chunk.map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+    return chunk.length;
+  }
+  write(buf: number, n: number): number {
+    const bytes = Array.from(this.mem.read(buf, n));
+    const hex = bytes.map(b => b.toString(16).padStart(2, '0')).join(' ');
+    this.onTx?.(bytes);
+    this.txLog.push(hex); if (this.txLog.length > 50) this.txLog.shift();
+    this.log(`  ${this.name} TX ${hex}`);
+    return n;
+  }
 }
 
 export function encodePng(rgba: Uint8Array, w: number, h: number): Buffer {

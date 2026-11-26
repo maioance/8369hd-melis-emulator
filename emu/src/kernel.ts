@@ -8,15 +8,16 @@ import { Cpu, CpuHalt, TRAP_BASE, type Host } from './cpu.ts';
 import { Memory } from './mem.ts';
 import { loadElf, type ModMagic } from './elf.ts';
 import { SWI_NAMES } from './swi-names.ts';
-import { DispDevice, StubDevice, SCREEN_W, SCREEN_H, type Device } from './devices.ts';
+import { DispDevice, StubDevice, QueueUart, SCREEN_W, SCREEN_H, PHYS_BASE, VIRT_BASE, PHYS_SIZE, type Device } from './devices.ts';
 
 // /dev nodes treated as absent on this board
-const ABSENT_DEVICES = new Set(['/dev/tpadc_rtp']);
+const ABSENT_DEVICES = new Set(['/dev/tpadc_rtp', '/dev/angle_sensor']);
 
 const A0 = 10, A1 = 11, A2 = 12, A3 = 13, A4 = 14, A5 = 15, A7 = 17, RA = 1, SP = 2;
 
-// Guest memory layout (all inside the 0xe0000000 window)
-const HEAP_BASE = 0xea000000, HEAP_END = 0xee000000;
+// Guest memory layout (all inside the 0xe0000000 window; the heap is handed out by its physical alias 0x4a000000,
+// like the device, so code that assumes heap pointers look like 0xe... fails here as it does there)
+const HEAP_BASE = 0x4a000000, HEAP_END = 0x4e000000;
 const STACK_BASE = 0xee000000, STACK_END = 0xef000000;
 const TRAP_THREAD_EXIT = TRAP_BASE;
 const TRAP_DYN_BASE = TRAP_BASE + 0x1000;
@@ -29,6 +30,8 @@ export interface KernelOptions {
   realtime?: boolean;        // tie the kernel tick (10 ms) to wall-clock time
   stubUnknown?: boolean;     // survey mode: unknown syscalls return 0 instead of halting
   udiskSeed?: string;        // folder copied into e:\ when it is empty (real UDISK contents)
+  usb?: string;              // optional host folder mounted as a (writable) USB stick on f:\
+  stubHwChecks?: boolean;    // --stub-hw-checks: see loadModuleImage
   sysConfig?: string;        // sys_config.fex served through esCFG_GetKeyValue
   cfgOverride?: Record<string, string>; // "section.key" -> value
 }
@@ -92,6 +95,7 @@ export class Kernel implements Host {
       const [sec, key] = k.split('.'); (this.cfg[sec] ??= {})[key] = v;
     }
     this.drives = { d: { host: opt.rootfs, rw: false }, e: { host: e, rw: true } };
+    if (opt.usb) this.drives.f = { host: opt.usb, rw: true }    // the device writes to USB sticks too (e.g. climabar_log.txt);
     this.cpu = new Cpu(this.mem, this);
     this.disp = new DispDevice(this.mem, s => this.log(s));
   }
@@ -126,7 +130,8 @@ export class Kernel implements Host {
     if (!addr) return this.malloc(size);
     const old = this.allocs.get(addr >>> 0) ?? 0;
     const n = this.malloc(size);
-    this.mem.buf.copyWithin(n - 0xe0000000, (addr >>> 0) - 0xe0000000, (addr >>> 0) - 0xe0000000 + Math.min(old, size));
+    const src = this.mem.off(addr, Math.min(old, size), 'read');
+    this.mem.buf.copyWithin(this.mem.off(n, 1, 'write'), src, src + Math.min(old, size));
     this.free(addr);
     return n;
   }
@@ -155,6 +160,7 @@ export class Kernel implements Host {
       const r = then(c.get(A0));
       if (r !== c.get(A0)) setRet(c, r); // otherwise keep the guest's full 64-bit return value
       c.pc = retPc;
+      c.setU32(RA, retPc);                 // like every syscall return, see ecall()
     }));
     cpu.pc = fn >>> 0;
   }
@@ -200,6 +206,14 @@ export class Kernel implements Host {
     for (const s of elf.segments) {
       this.mem.fill(s.vaddr, s.memsz, 0);
       this.mem.write(s.vaddr, elf.data.subarray(s.offset, s.offset + s.filesz));
+    }
+    if (this.opt.stubHwChecks && path.toLowerCase().endsWith('init.axf')) {
+      // --stub-hw-checks (8369HD init.axf 20250320 only): the app asks the MCU and the SPI NOR flash whether it runs
+      // on its own hardware and shows "unauthorized" otherwise. The emulator has neither chip, so these six checks
+      // answer "yes" - in the emulator's memory only; the firmware files and the head unit are never changed.
+      for (const fnAddr of [0xe91c95c8, 0xe91c95f8, 0xe91c9604, 0xe91c9610, 0xe91997c6, 0xe91996f2]) {
+        this.mem.w32(fnAddr, 0x80824505); // c.li a0, 1 ; c.jr ra
+      }
     }
     this.cpu.invalidate();
     const mid = 96 + elf.magic.type;
@@ -275,8 +289,29 @@ export class Kernel implements Host {
   }
 
   // ---------------------------------------------------------------- syscalls
+  /** EMU_FORCE=addr:value,..: a guest function at addr returns value at once (experiments, e.g. a licence check) */
+  private forced = new Map((process.env.EMU_FORCE ?? '').split(',').filter(Boolean)
+    .map(s => [parseInt(s.split(':')[0], 16) >>> 0, Number(s.split(':')[1] ?? 1)] as [number, number]));
+
+  watch(cpu: Cpu, pc: number): void {
+    const f = this.forced.get(pc);
+    if (f !== undefined) {
+      if (!this.seen.has(pc)) { this.seen.add(pc); this.log(`  FORCE 0x${pc.toString(16)} returns ${f} (from 0x${cpu.getU(RA).toString(16)})`); }
+      cpu.set(A0, f); cpu.pc = cpu.getU(RA);
+      return;
+    }
+    const a0 = cpu.getU(A0), ra = cpu.getU(RA);
+    let s = '';
+    try { s = this.mem.cstr(a0, 40); } catch { /* not a string */ }
+    this.log(`  WATCH 0x${pc.toString(16)} ra=0x${ra.toString(16)} a0=0x${a0.toString(16)}${s && /^[\x20-\x7e]+$/.test(s) ? ` "${s}"` : ''}`);
+  }
+
   ecall(cpu: Cpu): void {
     const n = cpu.getU(A7);
+    // The Melis kernel returns from a syscall by jumping into the handler with ra = sepc + 4 (esSYSCALL_function),
+    // so ra is clobbered: a stub must save ra around ecall, as the firmware's stubs do. Without that, the stub's
+    // `ret` loops on itself - on the device it hung the boot (logo only).
+    cpu.setU32(RA, cpu.pc);
     const name = SWI_NAMES[n] ?? `swi_0x${n.toString(16)}`;
     const h = this.handlers[name];
     if (this.opt.trace || !this.seen.has(n)) {
@@ -308,8 +343,9 @@ export class Kernel implements Host {
     esMEMS_Bfree(cpu) { this.free(cpu.getU(A0)); },
     esMEMS_Palloc(cpu) { return this.malloc(cpu.getU(A0) * 1024); },
     esMEMS_Pfree(cpu) { this.free(cpu.getU(A0)); },
-    esMEMS_VA2PA(cpu) { return cpu.getU(A0); },
+    esMEMS_VA2PA(cpu) { const va = cpu.getU(A0); return va >= VIRT_BASE && va < VIRT_BASE + PHYS_SIZE ? va - VIRT_BASE + PHYS_BASE : va >= PHYS_BASE && va < PHYS_BASE + PHYS_SIZE ? va : 0; },
     esMEMS_CleanFlushDCacheRegion() { return 0; },
+    esMEMS_FlushICacheRegion(cpu) { cpu.invalidate(); return 0; },   // code was patched: drop decoded instructions
     esMEMS_CleanDCacheRegion() { return 0; },
     esMEMS_FlushDCacheRegion() { return 0; },
     esMEMS_FreeMemSize() { return HEAP_END - this.heapTop; },
@@ -411,6 +447,24 @@ export class Kernel implements Host {
       const mp = cpu.getU(A0); if (!mp) return -1;
       const m = this.modules.get(this.mem.r8(mp));
       if (!m) throw new CpuHalt(`MIoctrl on mp 0x${mp.toString(16)} with unknown mid ${this.mem.r8(mp)}`);
+      const modName = m.path.split('\\').pop()?.toLowerCase() ?? '';
+      if (['wireless.mod', 'carplay.mod', 'auto.mod', 'oak.mod', 'cedar.mod'].includes(modName)) {
+        // Stub hardware streaming/Wi-Fi modules so CarPlay / Android Auto screens don't fault, but keep
+        // the event callback init.axf registers so the host can play the module's side of the link.
+        const cmd = cpu.getU(A1), aux = cpu.getU(A2), buf = cpu.getU(A3);
+        const linkType = modName === 'wireless.mod' && cmd === 100 ? aux + 4 // aux = link_type - 4 (5 CP / 6 AA wireless)
+          : modName === 'auto.mod' && cmd === 1 ? 2 : 0;                  // wired Android Auto
+        if (linkType && buf) {
+          const cb = this.mem.r32(buf) >>> 0;
+          this.linkCbs.set(linkType, cb);
+          this.startLinkThread();
+          this.log(`  [t${this.cur.tid}] ${modName} registered link_type=${linkType} event cb=0x${cb.toString(16)}`);
+        }
+        const key = `${modName} 0x${cmd.toString(16)}`;
+        if (this.opt.trace || !this.seenIoctl.has(key)) { this.seenIoctl.add(key); this.log(`  [t${this.cur.tid}] MIoctrl ${modName} cmd=0x${cmd.toString(16)} aux=0x${aux.toString(16)} buf=0x${buf.toString(16)} (stub)`); }
+        this.linkTx.push(`${modName} cmd=${cmd} aux=${aux} buf=0x${buf.toString(16)}`); if (this.linkTx.length > 60) this.linkTx.shift();
+        return 0;
+      }
       const key = `${m.path} 0x${cpu.getU(A1).toString(16)}`;
       if (this.opt.trace || !this.seenIoctl.has(key)) { this.seenIoctl.add(key); this.log(`  [t${this.cur.tid}] MIoctrl ${m.path.split('\\').pop()} cmd=0x${cpu.getU(A1).toString(16)} aux=0x${cpu.getU(A2).toString(16)} buf=0x${cpu.getU(A3).toString(16)}`); }
       this.callGuest(m.magic.mif.MIoctrl, [mp, cpu.getU(A1), cpu.getU(A2), cpu.getU(A3)], r => r);
@@ -435,7 +489,7 @@ export class Kernel implements Host {
       const dev = this.fds.get(cpu.getU(A1));
       if (dev) {
         const r = dev.read ? dev.read(cpu.getU(A2), cpu.getU(A3)) : 0;
-        if (r === 'block') { this.block('sleep', this.ticks + 100, t => { t.R[2 * A0] = 0; t.R[2 * A0 + 1] = 0; }); return; }
+        if (r === 'block') { this.block('sleep', this.ticks + 100, t => { t.R[2 * A0] = 0; t.R[2 * A0 + 1] = 0; }, 0x7f000000 + cpu.getU(A1)); return; }
         return r;
       }
       return this.files.has(cpu.getU(A1)) ? this.fread(cpu.getU(A1), cpu.getU(A2), cpu.getU(A3)) : -1; },
@@ -628,16 +682,65 @@ export class Kernel implements Host {
     t.pc = this.cont(loop);
   }
 
+  /** Event callbacks init.axf hands to wireless.mod / auto.mod, keyed by CLink link_type. */
+  linkCbs = new Map<number, number>();
+  /** Recent MIoctrl calls into the stubbed link modules (touch = cmd 8, SWC key = cmd 12). */
+  linkTx: string[] = [];
+  private linkQueue: { cb: number; words: number[] }[] = [];
+  private linkEv = 0;
+
+  /** Play the module side of the link: deliver event `words` ([opcode, ...]) to the registered callback. */
+  linkEvent(linkType: number, words: number[]): boolean {
+    const cb = this.linkCbs.get(linkType); if (!cb) return false;
+    this.linkQueue.push({ cb, words });
+    const t = this.threads.find(th => th.name === 'LinkMod' && th.state === 'sleep');
+    if (t) this.wake(t, false);
+    return true;
+  }
+
+  /** Kernel thread standing in for the module's event thread: calls cb(event_ptr) for each queued event. */
+  private startLinkThread(): void {
+    if (this.threads.some(t => t.name === 'LinkMod')) return;
+    this.linkEv = this.malloc(0x40);
+    const t = this.createThread(0, 0, 0x4000, 1, 'LinkMod');
+    const loop = (cpu: Cpu): void => {
+      const ev = this.linkQueue.shift();
+      if (!ev) { cpu.pc = this.cont(loop); this.block('sleep', this.ticks + 1000); return; }
+      this.mem.fill(this.linkEv, 0x40, 0);
+      ev.words.slice(0, 16).forEach((v, k) => this.mem.w32(this.linkEv + 4 * k, v));
+      cpu.setU32(A0, this.linkEv);
+      cpu.setU32(RA, this.cont(c => { c.pc = this.cont(loop); }));
+      cpu.pc = ev.cb;
+    };
+    t.pc = this.cont(loop);
+  }
+
   openDev(path: string): number {
     const name = path.toLowerCase();
     // Drivers this board doesn't have (or we don't emulate) must fail like a missing /dev node,
     // otherwise the app takes the wrong code path (e.g. resistive touch -> forced calibration).
     if (ABSENT_DEVICES.has(name)) { this.log(`  open("${path}") -> ENOENT (absent)`); return -1; }
-    const dev: Device = name === '/dev/disp' ? this.disp : new StubDevice(path, s => this.log(s));
+    const isUart = name === '/dev/uart1' || name === '/dev/uart3';
+    const dev: Device = name === '/dev/disp' ? this.disp
+      : isUart ? new QueueUart(path, this.mem, s => this.log(s))
+      : new StubDevice(path, s => this.log(s));
     const fd = this.nextFd++;
     this.fds.set(fd, dev);
-    this.log(`  open("${path}") -> fd ${fd}${dev instanceof StubDevice ? ' (stub)' : ''}`);
+    if (dev instanceof QueueUart) { this.uarts.set(name, { dev, fd }); dev.onTx = b => this.onUartTx?.(name, b); }
+    this.log(`  open("${path}") -> fd ${fd}${dev instanceof StubDevice ? ' (stub)' : dev instanceof QueueUart ? ' (injectable uart)' : ''}`);
     return fd;
+  }
+
+  /** Simulated serial ports (CAN box on /dev/uart3, MCU on /dev/uart1). */
+  uarts = new Map<string, { dev: QueueUart; fd: number }>();
+  /** Bytes the guest writes to a UART (lower-case device name). */
+  onUartTx?: (name: string, bytes: number[]) => void;
+  /** Inject bytes into a UART and wake the thread blocked in read() on it. */
+  uartPush(name: string, bytes: number[]): boolean {
+    const u = this.uarts.get(name); if (!u) return false;
+    u.dev.push(bytes);
+    for (const t of this.threads) if (t.state === 'sleep' && t.waitObj === 0x7f000000 + u.fd) this.wake(t, false);
+    return true;
   }
 
   private qpost(p: number, msg: number, front: boolean): number {

@@ -1,7 +1,7 @@
 // Shared setup: build a Kernel from CLI-style options and queue the EKIY boot sequence.
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { rmSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { Kernel } from './kernel.ts';
 import type { Cpu } from './cpu.ts';
 
@@ -40,6 +40,8 @@ export function createEmulator(a: Args, extra: { realtime?: boolean } = {}): Ker
     udiskSeed: a.flag('--empty-udisk') ? undefined : resolve(a.opt('--udisk', join(parts, '3_UDISK.bin.out'))),
     sysConfig: resolve(a.opt('--sys-config', join(parts, '1_bootA.bin.out/sys_config.fex'))),
     cfgOverride,
+    usb: a.opt('--usb', '') ? resolve(a.opt('--usb', '')) : undefined,
+    stubHwChecks: a.flag('--stub-hw-checks'),
   });
   queueBoot(k);
   return k;
@@ -47,15 +49,24 @@ export function createEmulator(a: Args, extra: { realtime?: boolean } = {}): Ker
 
 /**
  * Boot sequence on a "kernel init" thread: the kernel installs slib.mod (shared C library,
- * called through its table at 0xe8700000), display.mod and mixture.mod, then startup.sh runs
- * `insmod d:\apps\desktop.mod`. Each step calls MInit, then MOpen where the kernel would.
+ * called through its table at 0xe8700000), display.mod and mixture.mod, then startup.sh runs its
+ * `insmod` lines (stock: d:\apps\desktop.mod). Each step calls MInit, then MOpen where the kernel would.
  */
+/** Modules d:\startup.sh installs (overlay-aware, so a test module can be added there). */
+function startupMods(k: Kernel): string[] {
+  const host = k.resolvePath('d:\\startup.sh');
+  const mods = host && existsSync(host)
+    ? readFileSync(host, 'latin1').split(/\r?\n/).map(l => /^\s*insmod\s+(\S+)/i.exec(l)?.[1]).filter((m): m is string => !!m)
+    : [];
+  return mods.length ? mods : ['d:\\apps\\desktop.mod'];
+}
+
 function queueBoot(k: Kernel): void {
   const steps: { path: string; open: boolean }[] = [
     { path: 'd:\\mod\\slib.mod', open: false },
     { path: 'd:\\mod\\display.mod', open: true },
     { path: 'd:\\mod\\mixture.mod', open: true },
-    { path: 'd:\\apps\\desktop.mod', open: true },
+    ...startupMods(k).map(path => ({ path, open: true })),
   ];
   const t = k.createThread(0, 0, 0x8000, 0x10, 'kernel init');
   const next = (cpu: Cpu): void => {

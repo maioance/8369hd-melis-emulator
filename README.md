@@ -1,5 +1,27 @@
 # EKIY / Melis reverse engineering
 
+> **This is a fork** of [skyfortress/ekiy-melis-re](https://github.com/skyfortress/ekiy-melis-re) by Oleksii
+> Bondarenko (MIT), adapted to the **8369HD** head unit (1024 x 600, same F133 / Melis platform) for the
+> [8369hd-headunit-mod](https://github.com/maioance/8369hd-headunit-mod) project. The upstream text below describes
+> the original EKIY display.
+>
+> Differences from upstream:
+> - display 1024 x 600; the MCU (`/dev/uart1`) and the CAN box (`/dev/uart3`) as injectable UARTs, driven from a
+>   browser panel: steering wheel keys, doors, trip computer data, Climatronic, RDS station names, raw CAN frames
+> - a simulated phone behind the Bluetooth module (`emu/src/bt.ts`: AT# commands in MCU 0xD4 frames): connect,
+>   calls, phone book, A2DP play / pause / track info
+> - CarPlay / Android Auto links: the event callbacks init.axf registers with `wireless.mod` / `auto.mod` are kept,
+>   so the host can play the module's side (`POST /link`, `GET /linklog`); the modules themselves stay stubbed
+> - closer to the real hardware, after bugs the emulator first hid: the kernel overwrites `ra` on `ecall`, the heap is
+>   handed out at its physical alias `0x4a000000`, display buffers must be physical addresses, layers of the same
+>   display channel replace each other instead of blending
+> - `--usb <dir>`: a host folder as a writable USB stick on `F:\`; `EMU_WATCH` / `EMU_FORCE` debugging hooks
+> - `--stub-hw-checks` (off by default): the stock app checks through the MCU and the SPI NOR flash that it runs on
+>   its own hardware, which the emulator does not have; this option answers those six checks in the emulator's memory
+>   only (the firmware files and the head unit are never changed)
+> - a faster CPU loop and a live view over a WebSocket (changed rows only)
+> - `tools/build_volume_bar.py`, `tools/build_ac_bar.py`: popup builders for the 8369HD screens
+
 Run the real home-screen firmware of an EKIY 5-inch wireless CarPlay display on a PC, inspect its UI resources, and experiment with modifications without first flashing the device.
 
 ![Stock home screen of the EKIY display (vendor UI, shown for identification)](docs/img/stock-home.jpg)

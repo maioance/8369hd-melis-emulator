@@ -4,6 +4,9 @@
 
 export const MEM_BASE = 0xe0000000;
 export const MEM_SIZE = 0x10000000;
+/** The same RAM by physical address: on the device, heap memory (malloc / Palloc) is identity-mapped DRAM at
+ *  0x4xxxxxxx while modules are linked at 0xe9xxxxxx; physical 0x40000000 + x is virtual 0xe0000000 + x here. */
+export const PHYS_BASE = 0x40000000;
 
 export class MemFault extends Error {
   addr: number;
@@ -18,7 +21,8 @@ export class Memory {
   readonly dv = new DataView(this.buf.buffer);
 
   off(addr: number, size: number, kind: string): number {
-    const o = (addr >>> 0) - MEM_BASE;
+    let o = (addr >>> 0) - MEM_BASE;
+    if (o < 0) o = (addr >>> 0) - PHYS_BASE;
     if (o < 0 || o + size > MEM_SIZE) throw new MemFault(addr, kind);
     return o;
   }
